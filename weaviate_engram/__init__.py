@@ -17,6 +17,7 @@ pipelines supersede the old one. See README.md for details.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 
 from .client import EngramClient, EngramNotAvailableError, is_sdk_available
@@ -134,6 +136,24 @@ def _is_trivial(text: str) -> bool:
     return bool(_TRIVIAL_RE.match((text or "").strip()))
 
 
+def _coerce_properties(raw: Any) -> Optional[Dict[str, str]]:
+    """Coerce a tool-call ``metadata`` arg into Engram's ``properties`` shape.
+
+    Engram's ``properties`` field is typed ``dict[str, str]``. Models sometimes
+    pass nested or non-string values, so we stringify everything here and
+    return ``None`` (rather than an empty dict) when nothing usable is left —
+    that keeps the SDK call slim when there's no real metadata.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return None
+    out: Dict[str, str] = {}
+    for key, value in raw.items():
+        if value is None:
+            continue
+        out[str(key)] = str(value)
+    return out or None
+
+
 def _format_recall_context(results: List[Dict[str, Any]], limit: int) -> str:
     results = results[:limit]
     if not results:
@@ -174,9 +194,17 @@ STORE_SCHEMA = {
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "The memory content to store."},
-            "metadata": {"type": "object", "description": "Optional metadata attached to the memory."},
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Optional flat key/value tags forwarded to Engram's "
+                    "`properties` field. Keys and values are stringified."
+                ),
+                "additionalProperties": {"type": "string"},
+            },
         },
         "required": ["content"],
+        "additionalProperties": False,
     },
 }
 
@@ -190,6 +218,7 @@ SEARCH_SCHEMA = {
             "limit": {"type": "integer", "description": "Maximum results to return, 1 to 20."},
         },
         "required": ["query"],
+        "additionalProperties": False,
     },
 }
 
@@ -205,6 +234,7 @@ FETCH_SCHEMA = {
         "properties": {
             "query": {"type": "string", "description": "Optional query to focus the profile recall."},
         },
+        "additionalProperties": False,
     },
 }
 
@@ -285,8 +315,6 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
         print("\n".join(lines))
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        from hermes_constants import get_hermes_home
-
         self._hermes_home = kwargs.get("hermes_home") or str(get_hermes_home())
         self._session_id = session_id
 
@@ -320,9 +348,24 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
         self._write_enabled = agent_context not in {"subagent", "cron", "flush"}
 
         # Only activate if we have the API key AND the SDK is installed.
-        self._active = bool(self._api_key and is_sdk_available())
+        # Surface inactivity at INFO so users can see why memory tools are
+        # missing without having to crank up debug logging.
+        sdk_ok = is_sdk_available()
+        self._active = bool(self._api_key and sdk_ok)
         self._client = None
-        if self._active:
+        if not self._active:
+            if not self._api_key and not sdk_ok:
+                reason = "ENGRAM_API_KEY is unset and the `engram` SDK is not installed"
+            elif not self._api_key:
+                reason = "ENGRAM_API_KEY is unset"
+            else:
+                reason = "the `engram` SDK is not installed (`pip install weaviate-engram`)"
+            logger.info(
+                "Weaviate Engram memory provider inactive — %s. "
+                "engram_* tools will be unavailable until this is resolved.",
+                reason,
+            )
+        else:
             try:
                 self._client = EngramClient(
                     api_key=self._api_key,
@@ -331,12 +374,13 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
                 )
             except EngramNotAvailableError:
                 logger.info(
-                    "Weaviate Engram SDK not installed; provider will stay inactive. "
-                    "Install with: pip install weaviate-engram"
+                    "Weaviate Engram SDK not importable at construction time; "
+                    "provider will stay inactive. Install with: pip install weaviate-engram"
                 )
                 self._active = False
             except Exception:
                 logger.warning("Weaviate Engram client initialization failed", exc_info=True)
+                self._active = False
                 self._active = False
 
     def system_prompt_block(self) -> str:
@@ -396,14 +440,27 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
             except Exception:
                 logger.debug("Weaviate Engram sync_turn failed", exc_info=True)
 
-        # One in-flight sync at a time — drain previous before launching next.
-        if self._sync_thread and self._sync_thread.is_alive():
-            self._sync_thread.join(timeout=2.0)
+        # Bounded: never more than one in-flight sync thread. If the previous
+        # one is still alive after a short join, treat the backend as slow and
+        # SKIP this turn rather than spawning a second thread. The next turn
+        # will catch up once the in-flight one drains.
+        prev = self._sync_thread
+        if prev is not None and prev.is_alive():
+            prev.join(timeout=2.0)
+            if prev.is_alive():
+                logger.warning(
+                    "Weaviate Engram sync still in flight after 2s — "
+                    "dropping this turn's ingest to avoid thread accumulation."
+                )
+                return
         self._sync_thread = threading.Thread(target=_run, daemon=True, name="weaviate-engram-sync")
         self._sync_thread.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, STORE_SCHEMA, FETCH_SCHEMA]
+        # Deep-copy so the caller can mutate the returned dicts (e.g. wrap them
+        # in OpenAI's `{"type": "function", "function": ...}` envelope) without
+        # corrupting the module-level constants for the next call.
+        return [copy.deepcopy(s) for s in (SEARCH_SCHEMA, STORE_SCHEMA, FETCH_SCHEMA)]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if not self._active or not self._client:
@@ -444,8 +501,13 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
         content = str(args.get("content") or "").strip()
         if not content:
             return tool_error("content is required")
+        properties = _coerce_properties(args.get("metadata"))
         try:
-            run = self._client.add_memory(content, user_id=self._user_id)
+            run = self._client.add_memory(
+                content,
+                user_id=self._user_id,
+                properties=properties,
+            )
         except Exception as exc:
             return tool_error(f"Store failed: {exc}")
         preview = content[:80] + ("..." if len(content) > 80 else "")

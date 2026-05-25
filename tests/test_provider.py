@@ -52,10 +52,10 @@ class FakeEngramClient:
     def close(self):
         self.closed = True
 
-    def add_memory(self, text, *, user_id):
+    def add_memory(self, text, *, user_id, properties=None):
         if self.raise_on_add:
             raise self.raise_on_add
-        self.add_calls.append({"text": text, "user_id": user_id})
+        self.add_calls.append({"text": text, "user_id": user_id, "properties": properties})
         return {"run_id": f"run_{len(self.add_calls)}", "status": "queued"}
 
     def search_memories(self, query, *, user_id, limit=10):
@@ -135,6 +135,47 @@ class TestHelpers:
         assert "engram-context" not in out
         assert "real question" in out
         assert "tail" in out
+
+    def test_clean_for_capture_preserves_mid_string_content_after_fence(self):
+        # Pins down the actual behavior: the \s* after </engram-context> only
+        # eats whitespace, never alphanumerics. Any non-whitespace text that
+        # follows the fence (in a mid-string fence layout) must be preserved.
+        text = (
+            "leading sentence.\n"
+            "<engram-context>recalled stuff</engram-context>   "
+            "more text the assistant wrote AFTER the fence."
+        )
+        out = _clean_for_capture(text)
+        assert "engram-context" not in out
+        assert "leading sentence." in out
+        assert "more text the assistant wrote AFTER the fence." in out
+
+    def test_clean_for_capture_strips_multiple_fences(self):
+        text = (
+            "intro\n"
+            "<engram-context>first</engram-context>\n"
+            "middle paragraph stays\n"
+            "<engram-context>second</engram-context>\n"
+            "outro"
+        )
+        out = _clean_for_capture(text)
+        assert out.count("engram-context") == 0
+        assert "intro" in out
+        assert "middle paragraph stays" in out
+        assert "outro" in out
+        assert "first" not in out and "second" not in out
+
+    def test_coerce_properties_stringifies_values(self):
+        from weaviate_engram import _coerce_properties
+
+        assert _coerce_properties({"category": "preference", "weight": 7}) == {
+            "category": "preference",
+            "weight": "7",
+        }
+        assert _coerce_properties({}) is None
+        assert _coerce_properties(None) is None
+        assert _coerce_properties("not a dict") is None
+        assert _coerce_properties({"keep": "yes", "drop": None}) == {"keep": "yes"}
 
     def test_format_recall_context_empty_returns_empty_string(self):
         assert _format_recall_context([], limit=10) == ""
@@ -350,6 +391,45 @@ class TestSyncTurn:
         # Nothing recorded, but no crash.
         assert provider._client.add_calls == []
 
+    def test_sync_turn_skips_when_previous_thread_still_alive(self, provider, monkeypatch):
+        """Bounded-thread behavior: if Engram is hung, drop the new ingest
+        instead of stacking threads. The next turn will try again once the
+        in-flight one drains."""
+        import threading
+        import time
+
+        # Make add_memory block until we release it. The first sync_turn will
+        # start a thread that sits on this event; the second sync_turn should
+        # see prev.is_alive() and skip rather than spawn a second thread.
+        release = threading.Event()
+        original_add = provider._client.add_memory
+
+        def slow_add(text, *, user_id, properties=None):
+            release.wait(timeout=5.0)
+            return original_add(text, user_id=user_id, properties=properties)
+
+        monkeypatch.setattr(provider._client, "add_memory", slow_add)
+
+        # Speed up the test by clamping the join timeout the provider uses;
+        # we don't want to wait the real 2.0s in CI.
+        from unittest.mock import patch
+        provider.sync_turn("first user message here", "first assistant reply here")
+        first_thread = provider._sync_thread
+        assert first_thread is not None and first_thread.is_alive()
+
+        # Patch Thread.join to return immediately so the test doesn't wait 2s.
+        # The bounded-skip branch is what we actually want to exercise.
+        with patch.object(threading.Thread, "join", lambda self, timeout=None: None):
+            provider.sync_turn("second user message here", "second assistant reply here")
+            # Same thread object — nothing new was spawned.
+            assert provider._sync_thread is first_thread
+
+        # Let the first thread complete so we don't leak.
+        release.set()
+        first_thread.join(timeout=5.0)
+        # Only ONE add_memory call landed — the second was dropped on purpose.
+        assert len(provider._client.add_calls) == 1
+
 
 # ---------------------------------------------------------------------------
 # get_tool_schemas + handle_tool_call
@@ -360,6 +440,24 @@ class TestTools:
     def test_exposes_three_tools(self, provider):
         names = {schema["name"] for schema in provider.get_tool_schemas()}
         assert names == {"engram_search", "engram_store", "engram_fetch"}
+
+    def test_get_tool_schemas_returns_independent_copies(self, provider):
+        """Mutating one returned schema must not corrupt the next call."""
+        a = provider.get_tool_schemas()
+        b = provider.get_tool_schemas()
+        assert a is not b
+        for sa, sb in zip(a, b):
+            assert sa is not sb
+            assert sa["parameters"] is not sb["parameters"]
+        # Mutate one copy — the next call must still return pristine schemas.
+        a[0]["parameters"]["properties"]["query"]["description"] = "MUTATED"
+        c = provider.get_tool_schemas()
+        assert c[0]["parameters"]["properties"]["query"]["description"] != "MUTATED"
+
+    def test_all_tool_schemas_disallow_additional_properties(self, provider):
+        """Defensive: the model can't smuggle unknown args past us."""
+        for schema in provider.get_tool_schemas():
+            assert schema["parameters"].get("additionalProperties") is False
 
     def test_no_forget_or_delete_tool_exposed(self, provider):
         """Locks in the purposeful-forgetting design (no client-side delete)."""
@@ -420,6 +518,20 @@ class TestTools:
         call = provider._client.add_calls[-1]
         assert call["user_id"] == "default"
         assert call["text"] == "User moved to Lisbon in 2026"
+        assert call["properties"] is None  # no metadata → no properties forwarded
+
+    def test_store_forwards_metadata_as_engram_properties(self, provider):
+        provider.handle_tool_call(
+            "engram_store",
+            {
+                "content": "User prefers concise responses",
+                "metadata": {"category": "preference", "weight": 7, "drop_me": None},
+            },
+        )
+        call = provider._client.add_calls[-1]
+        # Engram's `properties` field is dict[str, str]; values get stringified
+        # and explicit Nones are dropped.
+        assert call["properties"] == {"category": "preference", "weight": "7"}
 
     def test_store_requires_content(self, provider):
         result = json.loads(provider.handle_tool_call("engram_store", {"content": "  "}))
