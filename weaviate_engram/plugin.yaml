@@ -1,0 +1,5 @@
+name: weaviate_engram
+version: 0.1.0
+description: "Weaviate Engram managed memory — semantic recall, server-side extract/reconcile pipelines, purposeful forgetting (no client-side delete)."
+pip_dependencies:
+  - "weaviate-engram>=0.6"

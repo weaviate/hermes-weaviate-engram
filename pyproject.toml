@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-weaviate-engram"
+version = "0.1.0"
+description = "Weaviate Engram memory provider plugin for Hermes Agent"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Marcin Antas", email = "marcin@weaviate.io" },
+]
+keywords = ["hermes", "weaviate", "engram", "memory", "agent", "llm"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "weaviate-engram>=0.6,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "pytest-timeout>=2.3,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/weaviate/hermes-weaviate-engram"
+Issues = "https://github.com/weaviate/hermes-weaviate-engram/issues"
+
+# Distribution model: this repo is installed by symlinking
+# ./weaviate_engram into ~/.hermes/plugins/ via install.sh. pyproject.toml
+# exists for tests and CI; we don't publish a wheel from it (yet).
+[tool.setuptools.packages.find]
+include = ["weaviate_engram*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-v"
+timeout = 30
