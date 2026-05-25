@@ -74,13 +74,27 @@ class EngramClient:
             except Exception:
                 logger.debug("Engram SDK close raised", exc_info=True)
 
-    def add_memory(self, text: str, *, user_id: str) -> Dict[str, Any]:
+    def add_memory(
+        self,
+        text: str,
+        *,
+        user_id: str,
+        properties: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
         """Ingest a single text payload into Engram for the given user.
 
         Engram processes the payload asynchronously via its server-side
         pipelines, so this call returns immediately with a Run handle.
+
+        ``properties`` maps to Engram's ``properties: dict[str, str]`` —
+        soft-isolation tags the pipeline can filter on at search time.
+        Callers must pre-stringify both keys and values (the SDK enforces
+        ``str -> str``).
         """
-        run = self._sdk.memories.add(text, user_id=user_id)
+        kwargs: Dict[str, Any] = {"user_id": user_id}
+        if properties:
+            kwargs["properties"] = properties
+        run = self._sdk.memories.add(text, **kwargs)
         return _run_to_dict(run)
 
     def search_memories(
@@ -117,8 +131,14 @@ def _run_to_dict(run: Any) -> Dict[str, Any]:
 def _memory_to_dict(item: Any) -> Dict[str, Any]:
     """Normalise an engram.Memory into a stable dict.
 
-    SDK Memory fields: id, content, topic, group, created_at, updated_at,
-    user_id, tags, score, properties, project_id.
+    SDK Memory fields available: id, content, topic, group, created_at,
+    updated_at, user_id, tags, score, properties, project_id.
+
+    Phase 1 intentionally surfaces only id / content / score / topic to keep
+    the tool payloads (and the model's attention) lean — neither the agent
+    nor the prefetch formatter needs the rest yet. When a future tool needs
+    timestamps, tags, or properties (e.g. property-scoped search), extend
+    this normaliser rather than reaching into the raw SDK object.
     """
     if isinstance(item, dict):
         score = item.get("score")
