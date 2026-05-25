@@ -97,15 +97,27 @@ Engram's reconcile pipeline supersedes the older memory. A regression test in th
 
 ## Development
 
+The dev environment is managed by [uv](https://docs.astral.sh/uv/) — install it once with `curl -LsSf https://astral.sh/uv/install.sh | sh` (or `brew install uv`).
+
 ```bash
 git clone https://github.com/weaviate/hermes-weaviate-engram.git
 cd hermes-weaviate-engram
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-pytest -v
+uv sync                  # creates .venv, installs runtime + dev deps from uv.lock
+uv run pytest -v         # 56 tests, fully mocked, no network
 ```
 
-Tests run fully mocked (no network) against a `FakeEngramClient`. They depend on Hermes Agent's `MemoryProvider` ABC and `tool_error` helper, which are installed as a dev dependency via `hermes-agent`.
+`uv sync` materialises a `.venv/` and installs:
+- `weaviate-engram` — the Engram SDK (runtime dep)
+- `pytest`, `pytest-timeout` — test deps
+- `hermes-agent` from `git+https://github.com/NousResearch/hermes-agent.git@main` — needed for the `MemoryProvider` ABC and `tool_error` helper that tests import
+
+If you have a local hermes-agent clone you want to develop against, override the git install with an editable one afterwards:
+
+```bash
+uv pip install -e ../hermes-agent
+```
+
+Tests run fully mocked against a `FakeEngramClient` — no live Engram API calls.
 
 ## Roadmap (Phase 2)
 
