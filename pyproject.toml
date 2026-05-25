@@ -24,21 +24,34 @@ dependencies = [
     "weaviate-engram>=0.6,<1",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=8,<10",
-    "pytest-timeout>=2.3,<3",
-]
-
 [project.urls]
 Homepage = "https://github.com/weaviate/hermes-weaviate-engram"
 Issues = "https://github.com/weaviate/hermes-weaviate-engram/issues"
 
 # Distribution model: this repo is installed by symlinking
 # ./weaviate_engram into ~/.hermes/plugins/ via install.sh. pyproject.toml
-# exists for tests and CI; we don't publish a wheel from it (yet).
+# exists for the dev environment (tests + CI); we don't publish a wheel
+# from it (yet).
 [tool.setuptools.packages.find]
 include = ["weaviate_engram*"]
+
+# Dev environment is managed by uv. Run `uv sync` to materialise .venv with
+# the runtime SDK plus everything below. hermes-agent is pulled from git
+# because the tests need `agent.memory_provider.MemoryProvider` and
+# `tools.registry.tool_error` — both live in the hermes-agent core, not on
+# PyPI. If you have a local hermes-agent checkout, run
+# `uv pip install -e ../hermes-agent` afterwards to override with editable.
+#
+# Uses PEP 735 dependency groups (https://peps.python.org/pep-0735/) — the
+# modern replacement for `[tool.uv].dev-dependencies`. uv installs the
+# `dev` group by default on `uv sync`; CI uses `uv sync --locked` to refuse
+# any drift from uv.lock.
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "pytest-timeout>=2.3,<3",
+    "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

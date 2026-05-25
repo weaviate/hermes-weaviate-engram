@@ -14,22 +14,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          python-version: ${{ matrix.python-version }}
+          # `enable-cache: true` caches both the uv binary and dependency
+          # downloads keyed by uv.lock — fast incremental CI.
+          enable-cache: true
 
-      - name: Install runtime dependency (engram SDK)
-        run: pip install "weaviate-engram>=0.6,<1"
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
 
-      - name: Install Hermes Agent (for MemoryProvider ABC + tool_error)
-        # Hermes Agent isn't on PyPI; install from the public repo so the
-        # plugin's `from agent.memory_provider import MemoryProvider` and
-        # `from tools.registry import tool_error` imports resolve.
-        run: pip install "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main"
-
-      - name: Install dev dependencies
-        run: pip install pytest pytest-timeout
+      - name: Sync dependencies (hash-verified from uv.lock)
+        # --locked refuses to update the lockfile in CI — if a manual edit
+        # to pyproject.toml drifted from uv.lock the build fails fast.
+        run: uv sync --locked --python ${{ matrix.python-version }}
 
       - name: Run tests
-        run: pytest -v
+        run: uv run pytest -v
