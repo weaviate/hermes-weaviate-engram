@@ -28,12 +28,18 @@ dependencies = [
 Homepage = "https://github.com/weaviate/hermes-weaviate-engram"
 Issues = "https://github.com/weaviate/hermes-weaviate-engram/issues"
 
-# Distribution model: this repo is installed by symlinking
-# ./weaviate_engram into ~/.hermes/plugins/ via install.sh. pyproject.toml
-# exists for the dev environment (tests + CI); we don't publish a wheel
-# from it (yet).
+# Hermes Agent discovers plugins via the ``hermes_agent.plugins`` entry-point
+# group (see hermes_cli/plugins.py:_scan_entry_points). With this declared,
+# ``pip install hermes-weaviate-engram`` is enough — no symlinking required.
+# The repo's install.sh remains for working from a git checkout.
+[project.entry-points."hermes_agent.plugins"]
+weaviate_engram = "weaviate_engram"
+
 [tool.setuptools.packages.find]
 include = ["weaviate_engram*"]
+
+[tool.setuptools.package-data]
+weaviate_engram = ["plugin.yaml"]
 
 # Dev environment is managed by uv. Run `uv sync` to materialise .venv with
 # the runtime SDK plus everything below. hermes-agent is pulled from git
