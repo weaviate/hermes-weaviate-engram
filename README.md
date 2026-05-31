@@ -16,28 +16,38 @@ Standalone [Weaviate Engram](https://weaviate.io/engram) memory provider plugin 
 
 ## Install
 
+### Recommended: via PyPI
+
 ```bash
-# 1. Clone the repo anywhere.
+pip install hermes-weaviate-engram
+hermes memory setup        # pick weaviate_engram
+```
+
+Hermes discovers the plugin via the `hermes_agent.plugins` entry point —
+no symlinking, no touching `~/.hermes/plugins/`. The wizard prompts for
+`ENGRAM_API_KEY` (saved to `~/.hermes/.env`) and sets `memory.provider`
+in `config.yaml`.
+
+### From a git checkout (development)
+
+```bash
 git clone https://github.com/weaviate/hermes-weaviate-engram.git
 cd hermes-weaviate-engram
-
-# 2. Symlink the plugin into $HERMES_HOME/plugins/.
-./install.sh
-
-# 3. Activate — the wizard installs the Engram SDK and prompts for your API key.
-hermes memory setup        # pick weaviate_engram
+./install.sh               # symlinks ./weaviate_engram into ~/.hermes/plugins/
+hermes memory setup        # pick weaviate_engram (installs the SDK + prompts for the API key)
 ```
 
 `install.sh` honors `$HERMES_HOME` if set (defaults to `~/.hermes`). It
 creates a symlink so plugin updates require nothing more than `git pull`
-inside the repo. Hermes discovers the plugin on next start.
+inside the repo.
 
-`hermes memory setup` installs `weaviate-engram` via the `pip_dependencies`
-declared in `plugin.yaml`, prompts for `ENGRAM_API_KEY` (saved to
-`~/.hermes/.env`), and sets `memory.provider` in `config.yaml`. If you'd
-rather wire it up by hand, the equivalent is `pip install weaviate-engram`,
-`echo 'ENGRAM_API_KEY=...' >> ~/.hermes/.env`, then
-`hermes config set memory.provider weaviate_engram`.
+### Manual wiring (skipping the wizard)
+
+```bash
+pip install hermes-weaviate-engram
+echo 'ENGRAM_API_KEY=...' >> ~/.hermes/.env
+hermes config set memory.provider weaviate_engram
+```
 
 ### Repo layout
 

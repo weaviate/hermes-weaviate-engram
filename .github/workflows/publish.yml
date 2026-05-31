@@ -1,0 +1,87 @@
+name: publish
+
+# Builds the wheel + sdist and publishes to PyPI on tag pushes matching
+# `v*` (e.g. `v0.1.0`, `v1.2.3-rc1`). Uses PyPI Trusted Publishing (OIDC)
+# — no API token is stored as a secret.
+#
+# One-time setup on PyPI:
+#   1. Create the project on PyPI (first release may need a manual upload
+#      OR use `pending` trusted publisher: https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/).
+#   2. Add a Trusted Publisher under the project's "Publishing" settings:
+#        Owner:           weaviate
+#        Repository:      hermes-weaviate-engram
+#        Workflow name:   publish.yml
+#        Environment:     pypi
+#   3. Create a GitHub environment named `pypi` on this repo
+#      (Settings → Environments → New environment). Optionally add a
+#      required reviewer to gate publishes behind manual approval.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Verify tag matches project version
+        # Refuse to publish if the git tag (vX.Y.Z) doesn't match the
+        # version in pyproject.toml. Catches the very easy mistake of
+        # tagging without bumping the version.
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          proj_version=$(uv run --no-project --with tomli python -c "import tomli, pathlib; print(tomli.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          if [ "$tag" != "$proj_version" ]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' (=> $tag) does not match pyproject.toml version '$proj_version'"
+            exit 1
+          fi
+          echo "Tag and project version both '$tag' — proceeding."
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Required for PyPI Trusted Publishing (OIDC).
+    permissions:
+      id-token: write
+    # Bind to a GitHub Environment so we get audit logs + optional
+    # manual-approval gating. Must match the environment name configured
+    # on PyPI's Trusted Publisher.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/hermes-weaviate-engram/
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
