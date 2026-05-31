@@ -285,35 +285,6 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
         sanitized = {k: v for k, v in (values or {}).items() if k != "api_key"}
         _save_config_file(sanitized, hermes_home)
 
-    def post_setup(self, hermes_home: str, config: dict) -> None:
-        """Called by ``hermes memory setup`` after credentials are saved.
-
-        We do not block on a live API probe — that adds latency and noise
-        to the wizard and the user can validate via ``hermes memory status``
-        later. Instead, print a short orientation pointing at the things
-        they may want to tune next.
-        """
-        sdk_ok = is_sdk_available()
-        lines = ["", "Weaviate Engram plugin configured."]
-        if not sdk_ok:
-            lines += [
-                "",
-                "  WARNING: the `engram` SDK is not yet installed.",
-                "  Install it with:  pip install weaviate-engram",
-            ]
-        cfg_path = Path(hermes_home) / "weaviate_engram.json"
-        lines += [
-            "",
-            "Next steps:",
-            f"  - Optional settings live in {cfg_path}",
-            "  - Pipelines (extraction / reconciliation) are configured in the",
-            "    Engram console, not from Hermes — see https://weaviate.io/engram",
-            "  - Tools exposed to the agent: engram_search, engram_store, engram_fetch",
-            "  - Forgetting is purposeful: store a correcting memory; do not expect a delete tool.",
-            "",
-        ]
-        print("\n".join(lines))
-
     def initialize(self, session_id: str, **kwargs) -> None:
         self._hermes_home = kwargs.get("hermes_home") or str(get_hermes_home())
         self._session_id = session_id
