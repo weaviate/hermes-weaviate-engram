@@ -35,18 +35,8 @@ fi
 ln -s "$SOURCE_DIR" "$TARGET"
 echo "✓ Installed: $TARGET → $SOURCE_DIR"
 
-if ! python3 -c "import engram" >/dev/null 2>&1; then
-    echo ""
-    echo "→ Next: install the Engram SDK"
-    echo "    pip install weaviate-engram"
-fi
-
-if [ -z "${ENGRAM_API_KEY:-}" ]; then
-    echo ""
-    echo "→ Then: set your API key"
-    echo "    echo 'ENGRAM_API_KEY=...' >> $HERMES_HOME/.env"
-fi
-
 echo ""
-echo "→ And activate the provider:"
+echo "→ Next: activate the provider"
 echo "    hermes memory setup    # pick weaviate_engram"
+echo ""
+echo "  The wizard installs the Engram SDK and prompts for your API key."
