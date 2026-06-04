@@ -238,6 +238,21 @@ class TestHelpers:
         _merge_conversation_id(src, "abc")
         assert src == {"k": "v"}
 
+    def test_merge_conversation_id_explicit_wins_over_properties(self):
+        """A caller passing both ``properties={'conversation_id': ...}`` and an
+        explicit ``conversation_id`` kwarg should get the explicit value.
+
+        This pins the documented precedence (see EngramClient.add_memory
+        docstring) so a future refactor of _merge_conversation_id can't
+        silently invert it.
+        """
+        from weaviate_engram.client import _merge_conversation_id
+
+        merged = _merge_conversation_id(
+            {"conversation_id": "old", "other": "x"}, "new"
+        )
+        assert merged == {"conversation_id": "new", "other": "x"}
+
 
 # ---------------------------------------------------------------------------
 # initialize
@@ -369,6 +384,99 @@ class TestPrefetch:
     def test_swallows_search_exceptions(self, provider):
         provider._client.raise_on_search = RuntimeError("network down")
         assert provider.prefetch("hello?") == ""
+
+
+# ---------------------------------------------------------------------------
+# Wire-format pin: conversation_id is currently smuggled into
+# properties["conversation_id"] because the Engram SDK has no top-level
+# conversation_id kwarg as of weaviate-engram==0.6.0. If a future refactor
+# drops the value from properties (or moves it to a different key), these
+# tests fail loudly so the change can't slip through unnoticed.
+# ---------------------------------------------------------------------------
+
+
+class TestConversationIdWireFormat:
+    """Wire-format pin: conversation_id is currently smuggled into
+    ``properties["conversation_id"]`` because the Engram SDK has no
+    top-level ``conversation_id`` kwarg as of ``weaviate-engram==0.6.0``.
+
+    These tests drive the *real* ``EngramClient`` wrapper (not the
+    ``FakeEngramClient`` test double) and replace only the SDK method,
+    so they exercise the actual ``_merge_conversation_id`` folding path
+    used in production. If a future refactor drops the value from
+    properties (or moves it to a different key), these tests fail
+    loudly so the change can't slip through unnoticed.
+    """
+
+    def test_search_folds_conversation_id_into_properties(self):
+        from weaviate_engram import EngramClient as RealEngramClient
+
+        captured: dict = {}
+
+        def spy_sdk_search(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        real_wrapper = RealEngramClient(api_key="test-key")
+        real_wrapper._sdk.memories.search = spy_sdk_search
+
+        real_wrapper.search_memories(
+            "anything", user_id="default", conversation_id="sess-77"
+        )
+
+        assert "conversation_id" not in captured, (
+            "Engram SDK (<=0.6.0) does not accept conversation_id as a "
+            "top-level kwarg on memories.search. If this is failing, the "
+            "SDK has grown the field — move the plugin to Phase 2 "
+            "(top-level pass-through) and update the docstrings in "
+            "client.py."
+        )
+        assert captured.get("properties", {}).get("conversation_id") == "sess-77"
+
+    def test_add_folds_conversation_id_into_properties(self):
+        from weaviate_engram import EngramClient as RealEngramClient
+
+        captured: dict = {}
+
+        def spy_sdk_add(input_data, **kwargs):
+            captured.update(kwargs)
+            return {"run_id": "r1", "status": "queued"}
+
+        real_wrapper = RealEngramClient(api_key="test-key")
+        real_wrapper._sdk.memories.add = spy_sdk_add
+
+        real_wrapper.add_memory(
+            "hello world", user_id="default", conversation_id="sess-78"
+        )
+
+        assert "conversation_id" not in captured, (
+            "Engram SDK (<=0.6.0) does not accept conversation_id as a "
+            "top-level kwarg on memories.add. If this is failing, the "
+            "SDK has grown the field — move the plugin to Phase 2 "
+            "(top-level pass-through) and update the docstrings in "
+            "client.py."
+        )
+        assert captured.get("properties", {}).get("conversation_id") == "sess-78"
+
+    def test_add_drops_conversation_id_when_sdk_receives_no_value(self):
+        """Sanity counterpart: when no conversation_id is passed, the
+        SDK call should not invent one. This guards against a future
+        bug where the wrapper accidentally leaks a default conversation
+        tag into every memory."""
+        from weaviate_engram import EngramClient as RealEngramClient
+
+        captured: dict = {}
+
+        def spy_sdk_add(input_data, **kwargs):
+            captured.update(kwargs)
+            return {"run_id": "r1", "status": "queued"}
+
+        real_wrapper = RealEngramClient(api_key="test-key")
+        real_wrapper._sdk.memories.add = spy_sdk_add
+
+        real_wrapper.add_memory("hello world", user_id="default")
+
+        assert "conversation_id" not in (captured.get("properties") or {})
 
 
 # ---------------------------------------------------------------------------

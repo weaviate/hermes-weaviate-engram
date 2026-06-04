@@ -92,17 +92,28 @@ class EngramClient:
         Callers must pre-stringify both keys and values (the SDK enforces
         ``str -> str``).
 
-        ``conversation_id`` scopes the memory to a specific conversation.
-        The current Engram SDK (<=1.0.0) does not surface this as a
-        first-class kwarg, so it is forwarded as a ``conversation_id``
-        entry in ``properties``. A caller-supplied ``conversation_id`` in
-        ``properties`` is preserved if the explicit kwarg is omitted.
+        ``conversation_id`` is a Hermes-side concept that scopes a memory
+        to a specific chat session. As of ``weaviate-engram==0.6.0`` the
+        SDK does NOT accept ``conversation_id`` as a top-level kwarg on
+        ``memories.add`` (signature: ``(input_data, *, user_id, group,
+        properties)``). Until the SDK grows a first-class field, this
+        client folds the value into ``properties["conversation_id"]`` so
+        it is at least persisted on the memory object. Whether the
+        Engram backend filters search results on this property is
+        server-side behavior and out of scope for this client — do not
+        assume conversation-scoped recall works without verifying
+        against the deployed Engram version.
+
+        If a caller passes ``properties`` *and* ``conversation_id``,
+        both are merged; an explicit ``conversation_id`` always wins
+        over a pre-existing ``properties["conversation_id"]``.
         """
         merged_props = _merge_conversation_id(properties, conversation_id)
-        kwargs: Dict[str, Any] = {"user_id": user_id}
-        if merged_props:
-            kwargs["properties"] = merged_props
-        run = self._sdk.memories.add(text, **kwargs)
+        run = self._sdk.memories.add(
+            text,
+            user_id=user_id,
+            properties=merged_props,
+        )
         return _run_to_dict(run)
 
     def search_memories(
@@ -119,14 +130,22 @@ class EngramClient:
         caller never has to know whether `limit` is honoured server-side.
 
         ``conversation_id`` narrows results to a specific conversation.
-        As with ``add_memory``, it is forwarded via ``properties`` until
-        the Engram SDK exposes a top-level kwarg.
+        As of ``weaviate-engram==0.6.0`` the SDK does NOT accept it as
+        a top-level kwarg on ``memories.search`` (signature: ``(*,
+        query, topics, user_id, group, retrieval_config, properties)``).
+        Until the SDK grows a first-class field, this client forwards
+        it as ``properties["conversation_id"]`` so the value is at
+        least sent to the backend. Whether the backend actually
+        filters on it is server-side behavior and not guaranteed —
+        treat conversation-scoped recall as best-effort, not as
+        hard isolation, until the SDK exposes a real field.
         """
-        search_kwargs: Dict[str, Any] = {"query": query, "user_id": user_id}
         merged_props = _merge_conversation_id(None, conversation_id)
-        if merged_props:
-            search_kwargs["properties"] = merged_props
-        results = self._sdk.memories.search(**search_kwargs)
+        results = self._sdk.memories.search(
+            query=query,
+            user_id=user_id,
+            properties=merged_props,
+        )
         out: List[Dict[str, Any]] = []
         for memory in results:
             out.append(_memory_to_dict(memory))
