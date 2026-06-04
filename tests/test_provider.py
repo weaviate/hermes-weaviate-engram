@@ -52,16 +52,26 @@ class FakeEngramClient:
     def close(self):
         self.closed = True
 
-    def add_memory(self, text, *, user_id, properties=None):
+    def add_memory(self, text, *, user_id, conversation_id=None, properties=None):
         if self.raise_on_add:
             raise self.raise_on_add
-        self.add_calls.append({"text": text, "user_id": user_id, "properties": properties})
+        self.add_calls.append({
+            "text": text,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "properties": properties,
+        })
         return {"run_id": f"run_{len(self.add_calls)}", "status": "queued"}
 
-    def search_memories(self, query, *, user_id, limit=10):
+    def search_memories(self, query, *, user_id, limit=10, conversation_id=None):
         if self.raise_on_search:
             raise self.raise_on_search
-        self.search_calls.append({"query": query, "user_id": user_id, "limit": limit})
+        self.search_calls.append({
+            "query": query,
+            "user_id": user_id,
+            "limit": limit,
+            "conversation_id": conversation_id,
+        })
         return self.search_results
 
 
@@ -207,6 +217,27 @@ class TestHelpers:
         assert cfg["max_recall_results"] == 20
         assert cfg["api_timeout"] == 60.0
 
+    def test_merge_conversation_id_folds_into_properties(self):
+        from weaviate_engram.client import _merge_conversation_id
+
+        # explicit conversation_id wins and is added to a copy of properties
+        merged = _merge_conversation_id({"k": "v"}, "session-1")
+        assert merged == {"k": "v", "conversation_id": "session-1"}
+
+        # whitespace-only conversation_id is dropped
+        assert _merge_conversation_id({"k": "v"}, "   ") == {"k": "v"}
+
+        # both inputs empty → None so SDK call stays slim
+        assert _merge_conversation_id(None, None) is None
+        assert _merge_conversation_id({}, "") is None
+
+    def test_merge_conversation_id_does_not_mutate_caller_dict(self):
+        from weaviate_engram.client import _merge_conversation_id
+
+        src = {"k": "v"}
+        _merge_conversation_id(src, "abc")
+        assert src == {"k": "v"}
+
 
 # ---------------------------------------------------------------------------
 # initialize
@@ -325,8 +356,15 @@ class TestPrefetch:
         assert "</engram-context>" in out
         assert "User prefers terse replies" in out
         assert "Working on the engram plugin" in out
-        # search was called with the resolved user_id
-        assert provider._client.search_calls[-1]["user_id"] == "default"
+        # search was called with the resolved user_id + conversation_id
+        call = provider._client.search_calls[-1]
+        assert call["user_id"] == "default"
+        assert call["conversation_id"] == "session-1"
+
+    def test_prefetch_per_call_session_id_overrides_initialize_value(self, provider):
+        provider._client.search_results = []
+        provider.prefetch("hello?", session_id="override-9")
+        assert provider._client.search_calls[-1]["conversation_id"] == "override-9"
 
     def test_swallows_search_exceptions(self, provider):
         provider._client.raise_on_search = RuntimeError("network down")
@@ -348,10 +386,22 @@ class TestSyncTurn:
         assert len(provider._client.add_calls) == 1
         call = provider._client.add_calls[0]
         assert call["user_id"] == "default"
+        # conversation_id comes from initialize("session-1", ...) and is
+        # sanitized the same way user_id is — the hyphen survives the sanitizer.
+        assert call["conversation_id"] == "session-1"
         assert call["text"] == (
             "User: Tell me about Hermes.\n"
             "Assistant: Hermes is a self-improving agent built by Nous Research."
         )
+
+    def test_per_call_session_id_overrides_initialize_value(self, provider):
+        provider.sync_turn(
+            "a question that's long enough",
+            "an answer that's long enough",
+            session_id="override-42",
+        )
+        _drain(provider)
+        assert provider._client.add_calls[-1]["conversation_id"] == "override-42"
 
     def test_strips_engram_fence_from_assistant_content(self, provider):
         provider.sync_turn(
@@ -404,9 +454,14 @@ class TestSyncTurn:
         release = threading.Event()
         original_add = provider._client.add_memory
 
-        def slow_add(text, *, user_id, properties=None):
+        def slow_add(text, *, user_id, conversation_id=None, properties=None):
             release.wait(timeout=5.0)
-            return original_add(text, user_id=user_id, properties=properties)
+            return original_add(
+                text,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                properties=properties,
+            )
 
         monkeypatch.setattr(provider._client, "add_memory", slow_add)
 
@@ -517,8 +572,19 @@ class TestTools:
         # The call lands in Engram as plain text scoped to the resolved user_id.
         call = provider._client.add_calls[-1]
         assert call["user_id"] == "default"
+        assert call["conversation_id"] == "session-1"
         assert call["text"] == "User moved to Lisbon in 2026"
         assert call["properties"] is None  # no metadata → no properties forwarded
+
+    def test_search_tool_forwards_conversation_id(self, provider):
+        provider._client.search_results = []
+        provider.handle_tool_call("engram_search", {"query": "x"})
+        assert provider._client.search_calls[-1]["conversation_id"] == "session-1"
+
+    def test_fetch_tool_forwards_conversation_id(self, provider):
+        provider._client.search_results = []
+        provider.handle_tool_call("engram_fetch", {})
+        assert provider._client.search_calls[-1]["conversation_id"] == "session-1"
 
     def test_store_forwards_metadata_as_engram_properties(self, provider):
         provider.handle_tool_call(

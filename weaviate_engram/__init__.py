@@ -354,6 +354,22 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
                 self._active = False
                 self._active = False
 
+    def _resolve_conversation_id(self, session_id: str = "") -> Optional[str]:
+        """Pick the session id to forward as Engram's ``conversation_id``.
+
+        Per-call ``session_id`` (passed via prefetch / sync_turn) wins over
+        the value stashed at ``initialize`` so a host that reuses one
+        provider across sessions still scopes memories correctly. The
+        result is sanitized with the same charset rule we apply to
+        ``user_id`` because we don't want to surprise the engram backend
+        with characters its tenant naming layer rejects.
+        """
+        raw = (session_id or "").strip() or (self._session_id or "").strip()
+        if not raw:
+            return None
+        cleaned = _sanitize_user_id(raw)
+        return cleaned or None
+
     def system_prompt_block(self) -> str:
         if not self._active:
             return ""
@@ -379,6 +395,7 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
                 query[:500],
                 user_id=self._user_id,
                 limit=self._max_recall_results,
+                conversation_id=self._resolve_conversation_id(session_id),
             )
             return _format_recall_context(results, self._max_recall_results)
         except Exception:
@@ -404,10 +421,11 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
         text = f"User: {clean_user}\nAssistant: {clean_assistant}"
         client = self._client
         user_id = self._user_id
+        conversation_id = self._resolve_conversation_id(session_id)
 
         def _run() -> None:
             try:
-                client.add_memory(text, user_id=user_id)
+                client.add_memory(text, user_id=user_id, conversation_id=conversation_id)
             except Exception:
                 logger.debug("Weaviate Engram sync_turn failed", exc_info=True)
 
@@ -453,7 +471,12 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
         except Exception:
             limit = 5
         try:
-            results = self._client.search_memories(query, user_id=self._user_id, limit=limit)
+            results = self._client.search_memories(
+                query,
+                user_id=self._user_id,
+                limit=limit,
+                conversation_id=self._resolve_conversation_id(),
+            )
         except Exception as exc:
             return tool_error(f"Search failed: {exc}")
         formatted: List[Dict[str, Any]] = []
@@ -477,6 +500,7 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
             run = self._client.add_memory(
                 content,
                 user_id=self._user_id,
+                conversation_id=self._resolve_conversation_id(),
                 properties=properties,
             )
         except Exception as exc:
@@ -488,7 +512,10 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
         query = str(args.get("query") or "user profile facts").strip() or "user profile facts"
         try:
             results = self._client.search_memories(
-                query, user_id=self._user_id, limit=self._max_recall_results
+                query,
+                user_id=self._user_id,
+                limit=self._max_recall_results,
+                conversation_id=self._resolve_conversation_id(),
             )
         except Exception as exc:
             return tool_error(f"Fetch failed: {exc}")

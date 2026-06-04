@@ -79,6 +79,7 @@ class EngramClient:
         text: str,
         *,
         user_id: str,
+        conversation_id: Optional[str] = None,
         properties: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Ingest a single text payload into Engram for the given user.
@@ -90,28 +91,66 @@ class EngramClient:
         soft-isolation tags the pipeline can filter on at search time.
         Callers must pre-stringify both keys and values (the SDK enforces
         ``str -> str``).
+
+        ``conversation_id`` scopes the memory to a specific conversation.
+        The current Engram SDK (<=1.0.0) does not surface this as a
+        first-class kwarg, so it is forwarded as a ``conversation_id``
+        entry in ``properties``. A caller-supplied ``conversation_id`` in
+        ``properties`` is preserved if the explicit kwarg is omitted.
         """
+        merged_props = _merge_conversation_id(properties, conversation_id)
         kwargs: Dict[str, Any] = {"user_id": user_id}
-        if properties:
-            kwargs["properties"] = properties
+        if merged_props:
+            kwargs["properties"] = merged_props
         run = self._sdk.memories.add(text, **kwargs)
         return _run_to_dict(run)
 
     def search_memories(
-        self, query: str, *, user_id: str, limit: int = 10
+        self,
+        query: str,
+        *,
+        user_id: str,
+        limit: int = 10,
+        conversation_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Semantic recall. Returns at most `limit` memory dicts.
 
         The SDK's SearchResults is list-like; we slice here so the
         caller never has to know whether `limit` is honoured server-side.
+
+        ``conversation_id`` narrows results to a specific conversation.
+        As with ``add_memory``, it is forwarded via ``properties`` until
+        the Engram SDK exposes a top-level kwarg.
         """
-        results = self._sdk.memories.search(query=query, user_id=user_id)
+        search_kwargs: Dict[str, Any] = {"query": query, "user_id": user_id}
+        merged_props = _merge_conversation_id(None, conversation_id)
+        if merged_props:
+            search_kwargs["properties"] = merged_props
+        results = self._sdk.memories.search(**search_kwargs)
         out: List[Dict[str, Any]] = []
         for memory in results:
             out.append(_memory_to_dict(memory))
             if len(out) >= limit:
                 break
         return out
+
+
+def _merge_conversation_id(
+    properties: Optional[Dict[str, str]],
+    conversation_id: Optional[str],
+) -> Optional[Dict[str, str]]:
+    """Fold an explicit ``conversation_id`` into the ``properties`` dict.
+
+    Returns a fresh dict so callers can keep reusing their own. Empty /
+    whitespace-only values are dropped. If the result has no entries we
+    return ``None`` so the SDK call stays slim.
+    """
+    merged: Dict[str, str] = dict(properties or {})
+    if conversation_id is not None:
+        cid = str(conversation_id).strip()
+        if cid:
+            merged["conversation_id"] = cid
+    return merged or None
 
 
 def _run_to_dict(run: Any) -> Dict[str, Any]:
