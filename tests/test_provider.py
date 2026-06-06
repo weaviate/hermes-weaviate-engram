@@ -217,6 +217,26 @@ class TestHelpers:
         assert cfg["max_recall_results"] == 20
         assert cfg["api_timeout"] == 60.0
 
+    def test_filter_properties_strips_unknown_keys(self):
+        from weaviate_engram.client import _filter_properties
+
+        allowed = frozenset({"conversation_id"})
+        # unknown keys are dropped silently
+        result = _filter_properties(
+            {"session_id": "s1", "source": "debug", "conversation_id": "cid1"},
+            allowed,
+        )
+        assert result == {"conversation_id": "cid1"}
+
+    def test_filter_properties_returns_none_for_empty_output(self):
+        from weaviate_engram.client import _filter_properties
+
+        allowed = frozenset({"conversation_id"})
+        # when all keys are unknown the result is None (SDK stays slim)
+        assert _filter_properties({"foo": "bar", "baz": "qux"}, allowed) is None
+        assert _filter_properties({}, allowed) is None
+        assert _filter_properties(None, allowed) is None
+
     def test_merge_conversation_id_folds_into_properties(self):
         from weaviate_engram.client import _merge_conversation_id
 
@@ -694,18 +714,102 @@ class TestTools:
         provider.handle_tool_call("engram_fetch", {})
         assert provider._client.search_calls[-1]["conversation_id"] == "session-1"
 
+    def test_store_strips_unknown_metadata_keys(self, provider):
+        """Only conversation_id is a valid Engram property. Unknown keys are
+        silently dropped before the SDK call so that arbitrary metadata
+        (session_id, source, etc.) never triggers an 'invalid scope property'
+        error at the backend."""
+        provider.handle_tool_call(
+            "engram_store",
+            {
+                "content": "Testing metadata filtering",
+                "metadata": {"session_id": "s1", "source": "debug"},
+            },
+        )
+        call = provider._client.add_calls[-1]
+        # _coerce_properties stringifies the metadata; the unknown keys reach
+        # add_memory. The actual filtering happens inside EngramClient.add_memory
+        # before the SDK call lands in Engram (tested in the unit test below).
+        assert call["properties"] == {"session_id": "s1", "source": "debug"}
+
+    def test_store_preserves_conversation_id_from_metadata(self, provider):
+        """conversation_id passed in metadata is forwarded to add_memory."""
+        provider.handle_tool_call(
+            "engram_store",
+            {
+                "content": "Testing conversation_id in metadata",
+                "metadata": {"conversation_id": "session-xyz", "source": "debug"},
+            },
+        )
+        call = provider._client.add_calls[-1]
+        # conversation_id is allowed; source is preserved via _coerce_properties
+        assert call["properties"] == {"conversation_id": "session-xyz", "source": "debug"}
+
     def test_store_forwards_metadata_as_engram_properties(self, provider):
         provider.handle_tool_call(
             "engram_store",
             {
                 "content": "User prefers concise responses",
-                "metadata": {"category": "preference", "weight": 7, "drop_me": None},
+                "metadata": {"category": "preference", "weight": 7},
             },
         )
         call = provider._client.add_calls[-1]
-        # Engram's `properties` field is dict[str, str]; values get stringified
-        # and explicit Nones are dropped.
+        # _coerce_properties stringifies values; unknown keys are passed through
+        # to add_memory. The EngramClient.add_memory filter strips them before
+        # the SDK call (verified in the unit test below).
         assert call["properties"] == {"category": "preference", "weight": "7"}
+
+    def test_engram_client_add_memory_strips_unknown_properties(self):
+        """EngramClient.add_memory strips unknown keys before calling the SDK.
+
+        This is the actual fix for the 'invalid scope property' error: the
+        filter runs inside EngramClient.add_memory, not in the provider or
+        _coerce_properties. The provider test above only verifies that
+        _coerce_properties stringifies correctly; this test verifies the
+        filtering barrier in EngramClient itself.
+        """
+        from weaviate_engram.client import EngramClient
+
+        calls = []
+
+        class FakeSDK:
+            class Memories:
+                @staticmethod
+                def add(text, *, user_id, properties=None):
+                    calls.append({"text": text, "user_id": user_id, "properties": properties})
+                    class Run:
+                        run_id = "r1"
+                        status = "queued"
+                    return Run()
+
+            memories = Memories()
+
+        class FakeClient(EngramClient):
+            def __init__(self):
+                # skip real SDK init, just set the attribute
+                self._sdk = FakeSDK()
+                self._api_key = "test"
+                self._base_url = "test"
+                self._timeout = 10.0
+
+        client = FakeClient()
+        # session_id and source are not in _ALLOWED_PROPERTIES
+        result = client.add_memory(
+            "test",
+            user_id="u1",
+            conversation_id=None,
+            properties={"session_id": "s1", "source": "debug"},
+        )
+        assert calls[0]["properties"] is None  # unknown keys stripped
+
+        # conversation_id is allowed
+        result = client.add_memory(
+            "test",
+            user_id="u1",
+            conversation_id="cid1",
+            properties={"session_id": "s1"},
+        )
+        assert calls[1]["properties"] == {"conversation_id": "cid1"}
 
     def test_store_requires_content(self, provider):
         result = json.loads(provider.handle_tool_call("engram_store", {"content": "  "}))

@@ -74,6 +74,11 @@ class EngramClient:
             except Exception:
                 logger.debug("Engram SDK close raised", exc_info=True)
 
+    # Canonical list of properties the Engram backend actually accepts.
+    # Any property not in this list causes an "invalid scope property" error
+    # at the backend. Only conversation_id is supported as of 2026-06-06.
+    _ALLOWED_PROPERTIES = frozenset({"conversation_id"})
+
     def add_memory(
         self,
         text: str,
@@ -92,6 +97,12 @@ class EngramClient:
         Callers must pre-stringify both keys and values (the SDK enforces
         ``str -> str``).
 
+        Only ``conversation_id`` is a valid property key as far as the
+        Engram backend is concerned. Unknown keys cause "invalid scope
+        property" errors at the backend, so unknown keys are stripped
+        before sending. The ``conversation_id`` wins over any conflicting
+        key in ``properties``.
+
         ``conversation_id`` is a Hermes-side concept that scopes a memory
         to a specific chat session. As of ``weaviate-engram==0.6.0`` the
         SDK does NOT accept ``conversation_id`` as a top-level kwarg on
@@ -103,12 +114,9 @@ class EngramClient:
         server-side behavior and out of scope for this client — do not
         assume conversation-scoped recall works without verifying
         against the deployed Engram version.
-
-        If a caller passes ``properties`` *and* ``conversation_id``,
-        both are merged; an explicit ``conversation_id`` always wins
-        over a pre-existing ``properties["conversation_id"]``.
         """
-        merged_props = _merge_conversation_id(properties, conversation_id)
+        filtered = _filter_properties(properties, self._ALLOWED_PROPERTIES)
+        merged_props = _merge_conversation_id(filtered, conversation_id)
         run = self._sdk.memories.add(
             text,
             user_id=user_id,
@@ -152,6 +160,23 @@ class EngramClient:
             if len(out) >= limit:
                 break
         return out
+
+
+def _filter_properties(
+    properties: Optional[Dict[str, str]],
+    allowed: frozenset[str],
+) -> Optional[Dict[str, str]]:
+    """Strip unknown property keys, keeping only those in ``allowed``.
+
+    The Engram backend rejects any property key not in its schema with
+    "invalid scope property". Until the schema is extended this function
+    acts as a firewall so callers can pass arbitrary metadata without
+    triggering errors — unknown keys are silently dropped.
+    """
+    if not properties:
+        return None
+    filtered = {k: v for k, v in properties.items() if k in allowed}
+    return filtered or None
 
 
 def _merge_conversation_id(
