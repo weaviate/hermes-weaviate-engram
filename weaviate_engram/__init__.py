@@ -136,24 +136,6 @@ def _is_trivial(text: str) -> bool:
     return bool(_TRIVIAL_RE.match((text or "").strip()))
 
 
-def _coerce_properties(raw: Any) -> Optional[Dict[str, str]]:
-    """Coerce a tool-call ``metadata`` arg into Engram's ``properties`` shape.
-
-    Engram's ``properties`` field is typed ``dict[str, str]``. Models sometimes
-    pass nested or non-string values, so we stringify everything here and
-    return ``None`` (rather than an empty dict) when nothing usable is left —
-    that keeps the SDK call slim when there's no real metadata.
-    """
-    if not isinstance(raw, dict) or not raw:
-        return None
-    out: Dict[str, str] = {}
-    for key, value in raw.items():
-        if value is None:
-            continue
-        out[str(key)] = str(value)
-    return out or None
-
-
 def _format_recall_context(results: List[Dict[str, Any]], limit: int) -> str:
     results = results[:limit]
     if not results:
@@ -194,14 +176,6 @@ STORE_SCHEMA = {
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "The memory content to store."},
-            "metadata": {
-                "type": "object",
-                "description": (
-                    "Optional flat key/value tags forwarded to Engram's "
-                    "`properties` field. Keys and values are stringified."
-                ),
-                "additionalProperties": {"type": "string"},
-            },
         },
         "required": ["content"],
         "additionalProperties": False,
@@ -495,13 +469,11 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
         content = str(args.get("content") or "").strip()
         if not content:
             return tool_error("content is required")
-        properties = _coerce_properties(args.get("metadata"))
         try:
             run = self._client.add_memory(
                 content,
                 user_id=self._user_id,
                 conversation_id=self._resolve_conversation_id(),
-                properties=properties,
             )
         except Exception as exc:
             return tool_error(f"Store failed: {exc}")

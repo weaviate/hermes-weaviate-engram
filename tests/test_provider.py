@@ -175,18 +175,6 @@ class TestHelpers:
         assert "outro" in out
         assert "first" not in out and "second" not in out
 
-    def test_coerce_properties_stringifies_values(self):
-        from weaviate_engram import _coerce_properties
-
-        assert _coerce_properties({"category": "preference", "weight": 7}) == {
-            "category": "preference",
-            "weight": "7",
-        }
-        assert _coerce_properties({}) is None
-        assert _coerce_properties(None) is None
-        assert _coerce_properties("not a dict") is None
-        assert _coerce_properties({"keep": "yes", "drop": None}) == {"keep": "yes"}
-
     def test_format_recall_context_empty_returns_empty_string(self):
         assert _format_recall_context([], limit=10) == ""
 
@@ -250,6 +238,33 @@ class TestHelpers:
         # both inputs empty → None so SDK call stays slim
         assert _merge_conversation_id(None, None) is None
         assert _merge_conversation_id({}, "") is None
+
+    def test_filter_properties_logs_dropped_keys_at_debug(self, caplog):
+        """A caller wondering why their tag didn't land on the memory should
+        find a DEBUG-level breadcrumb naming the dropped keys."""
+        import logging
+        from weaviate_engram.client import _filter_properties
+
+        with caplog.at_level(logging.DEBUG, logger="weaviate_engram.client"):
+            _filter_properties(
+                {"conversation_id": "ok", "weight": "7", "source": "x"},
+                frozenset({"conversation_id"}),
+            )
+        # Both dropped keys appear in a single log line, sorted for stable output.
+        assert any(
+            "Dropped unknown engram property keys" in r.message
+            and "weight" in r.message
+            and "source" in r.message
+            for r in caplog.records
+        )
+
+    def test_filter_properties_silent_when_nothing_dropped(self, caplog):
+        import logging
+        from weaviate_engram.client import _filter_properties
+
+        with caplog.at_level(logging.DEBUG, logger="weaviate_engram.client"):
+            _filter_properties({"conversation_id": "ok"}, frozenset({"conversation_id"}))
+        assert not any("Dropped" in r.message for r in caplog.records)
 
     def test_merge_conversation_id_does_not_mutate_caller_dict(self):
         from weaviate_engram.client import _merge_conversation_id
@@ -714,59 +729,12 @@ class TestTools:
         provider.handle_tool_call("engram_fetch", {})
         assert provider._client.search_calls[-1]["conversation_id"] == "session-1"
 
-    def test_store_strips_unknown_metadata_keys(self, provider):
-        """Only conversation_id is a valid Engram property. Unknown keys are
-        silently dropped before the SDK call so that arbitrary metadata
-        (session_id, source, etc.) never triggers an 'invalid scope property'
-        error at the backend."""
-        provider.handle_tool_call(
-            "engram_store",
-            {
-                "content": "Testing metadata filtering",
-                "metadata": {"session_id": "s1", "source": "debug"},
-            },
-        )
-        call = provider._client.add_calls[-1]
-        # _coerce_properties stringifies the metadata; the unknown keys reach
-        # add_memory. The actual filtering happens inside EngramClient.add_memory
-        # before the SDK call lands in Engram (tested in the unit test below).
-        assert call["properties"] == {"session_id": "s1", "source": "debug"}
-
-    def test_store_preserves_conversation_id_from_metadata(self, provider):
-        """conversation_id passed in metadata is forwarded to add_memory."""
-        provider.handle_tool_call(
-            "engram_store",
-            {
-                "content": "Testing conversation_id in metadata",
-                "metadata": {"conversation_id": "session-xyz", "source": "debug"},
-            },
-        )
-        call = provider._client.add_calls[-1]
-        # conversation_id is allowed; source is preserved via _coerce_properties
-        assert call["properties"] == {"conversation_id": "session-xyz", "source": "debug"}
-
-    def test_store_forwards_metadata_as_engram_properties(self, provider):
-        provider.handle_tool_call(
-            "engram_store",
-            {
-                "content": "User prefers concise responses",
-                "metadata": {"category": "preference", "weight": 7},
-            },
-        )
-        call = provider._client.add_calls[-1]
-        # _coerce_properties stringifies values; unknown keys are passed through
-        # to add_memory. The EngramClient.add_memory filter strips them before
-        # the SDK call (verified in the unit test below).
-        assert call["properties"] == {"category": "preference", "weight": "7"}
-
     def test_engram_client_add_memory_strips_unknown_properties(self):
         """EngramClient.add_memory strips unknown keys before calling the SDK.
 
-        This is the actual fix for the 'invalid scope property' error: the
-        filter runs inside EngramClient.add_memory, not in the provider or
-        _coerce_properties. The provider test above only verifies that
-        _coerce_properties stringifies correctly; this test verifies the
-        filtering barrier in EngramClient itself.
+        This is the firewall that prevents 'invalid scope property' errors
+        at the backend: any property key not in _ALLOWED_PROPERTIES is
+        dropped before the SDK call is issued.
         """
         from weaviate_engram.client import EngramClient
 
@@ -810,6 +778,48 @@ class TestTools:
             properties={"session_id": "s1"},
         )
         assert calls[1]["properties"] == {"conversation_id": "cid1"}
+
+    def test_engram_client_search_memories_strips_unknown_properties(self):
+        """search_memories now mirrors add_memory: ``properties`` is filtered
+        against ``_ALLOWED_PROPERTIES`` before reaching the SDK, so a caller
+        passing a tag the backend doesn't know about can't trigger an
+        'invalid scope property' error on recall."""
+        from weaviate_engram.client import EngramClient
+
+        calls = []
+
+        class FakeSDK:
+            class Memories:
+                @staticmethod
+                def search(*, query, user_id, properties=None):
+                    calls.append({"query": query, "user_id": user_id, "properties": properties})
+                    return []
+
+            memories = Memories()
+
+        class FakeClient(EngramClient):
+            def __init__(self):
+                self._sdk = FakeSDK()
+                self._api_key = "test"
+                self._base_url = "test"
+                self._timeout = 10.0
+
+        client = FakeClient()
+
+        # unknown property is dropped
+        client.search_memories(
+            "anything", user_id="u1", properties={"source": "debug"}
+        )
+        assert calls[0]["properties"] is None
+
+        # explicit conversation_id wins over conflicting key in properties
+        client.search_memories(
+            "anything",
+            user_id="u1",
+            conversation_id="cid-a",
+            properties={"conversation_id": "cid-b", "source": "debug"},
+        )
+        assert calls[1]["properties"] == {"conversation_id": "cid-a"}
 
     def test_store_requires_content(self, provider):
         result = json.loads(provider.handle_tool_call("engram_store", {"content": "  "}))

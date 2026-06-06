@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "https://api.engram.weaviate.io"
 
+# Canonical list of properties the Engram backend actually accepts.
+# Any property not in this list causes an "invalid scope property" error
+# at the backend. Only conversation_id is supported as of 2026-06-06.
+# Extend this set when the backend schema grows new keys.
+_ALLOWED_PROPERTIES: frozenset[str] = frozenset({"conversation_id"})
+
 
 class EngramNotAvailableError(RuntimeError):
     """Raised when the `engram` SDK can't be imported.
@@ -74,11 +80,6 @@ class EngramClient:
             except Exception:
                 logger.debug("Engram SDK close raised", exc_info=True)
 
-    # Canonical list of properties the Engram backend actually accepts.
-    # Any property not in this list causes an "invalid scope property" error
-    # at the backend. Only conversation_id is supported as of 2026-06-06.
-    _ALLOWED_PROPERTIES = frozenset({"conversation_id"})
-
     def add_memory(
         self,
         text: str,
@@ -115,7 +116,7 @@ class EngramClient:
         assume conversation-scoped recall works without verifying
         against the deployed Engram version.
         """
-        filtered = _filter_properties(properties, self._ALLOWED_PROPERTIES)
+        filtered = _filter_properties(properties, _ALLOWED_PROPERTIES)
         merged_props = _merge_conversation_id(filtered, conversation_id)
         run = self._sdk.memories.add(
             text,
@@ -131,11 +132,17 @@ class EngramClient:
         user_id: str,
         limit: int = 10,
         conversation_id: Optional[str] = None,
+        properties: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         """Semantic recall. Returns at most `limit` memory dicts.
 
         The SDK's SearchResults is list-like; we slice here so the
         caller never has to know whether `limit` is honoured server-side.
+
+        ``properties`` and ``conversation_id`` follow the same rules as
+        ``add_memory``: unknown property keys are stripped against
+        ``_ALLOWED_PROPERTIES`` before being sent, and an explicit
+        ``conversation_id`` wins over any conflicting key in ``properties``.
 
         ``conversation_id`` narrows results to a specific conversation.
         As of ``weaviate-engram==0.6.0`` the SDK does NOT accept it as
@@ -148,7 +155,8 @@ class EngramClient:
         treat conversation-scoped recall as best-effort, not as
         hard isolation, until the SDK exposes a real field.
         """
-        merged_props = _merge_conversation_id(None, conversation_id)
+        filtered = _filter_properties(properties, _ALLOWED_PROPERTIES)
+        merged_props = _merge_conversation_id(filtered, conversation_id)
         results = self._sdk.memories.search(
             query=query,
             user_id=user_id,
@@ -171,11 +179,20 @@ def _filter_properties(
     The Engram backend rejects any property key not in its schema with
     "invalid scope property". Until the schema is extended this function
     acts as a firewall so callers can pass arbitrary metadata without
-    triggering errors — unknown keys are silently dropped.
+    triggering errors — unknown keys are dropped, and dropped keys are
+    logged at DEBUG so the loss is debuggable when callers wonder why
+    their tag didn't land on the memory.
     """
     if not properties:
         return None
     filtered = {k: v for k, v in properties.items() if k in allowed}
+    dropped = set(properties) - filtered.keys()
+    if dropped:
+        logger.debug(
+            "Dropped unknown engram property keys: %s (allowed=%s)",
+            sorted(dropped),
+            sorted(allowed),
+        )
     return filtered or None
 
 
