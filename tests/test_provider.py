@@ -52,16 +52,26 @@ class FakeEngramClient:
     def close(self):
         self.closed = True
 
-    def add_memory(self, text, *, user_id, properties=None):
+    def add_memory(self, text, *, user_id, conversation_id=None, properties=None):
         if self.raise_on_add:
             raise self.raise_on_add
-        self.add_calls.append({"text": text, "user_id": user_id, "properties": properties})
+        self.add_calls.append({
+            "text": text,
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "properties": properties,
+        })
         return {"run_id": f"run_{len(self.add_calls)}", "status": "queued"}
 
-    def search_memories(self, query, *, user_id, limit=10):
+    def search_memories(self, query, *, user_id, limit=10, conversation_id=None):
         if self.raise_on_search:
             raise self.raise_on_search
-        self.search_calls.append({"query": query, "user_id": user_id, "limit": limit})
+        self.search_calls.append({
+            "query": query,
+            "user_id": user_id,
+            "limit": limit,
+            "conversation_id": conversation_id,
+        })
         return self.search_results
 
 
@@ -165,18 +175,6 @@ class TestHelpers:
         assert "outro" in out
         assert "first" not in out and "second" not in out
 
-    def test_coerce_properties_stringifies_values(self):
-        from weaviate_engram import _coerce_properties
-
-        assert _coerce_properties({"category": "preference", "weight": 7}) == {
-            "category": "preference",
-            "weight": "7",
-        }
-        assert _coerce_properties({}) is None
-        assert _coerce_properties(None) is None
-        assert _coerce_properties("not a dict") is None
-        assert _coerce_properties({"keep": "yes", "drop": None}) == {"keep": "yes"}
-
     def test_format_recall_context_empty_returns_empty_string(self):
         assert _format_recall_context([], limit=10) == ""
 
@@ -206,6 +204,89 @@ class TestHelpers:
         cfg = _load_config(str(tmp_path))
         assert cfg["max_recall_results"] == 20
         assert cfg["api_timeout"] == 60.0
+
+    def test_filter_properties_strips_unknown_keys(self):
+        from weaviate_engram.client import _filter_properties
+
+        allowed = frozenset({"conversation_id"})
+        # unknown keys are dropped silently
+        result = _filter_properties(
+            {"session_id": "s1", "source": "debug", "conversation_id": "cid1"},
+            allowed,
+        )
+        assert result == {"conversation_id": "cid1"}
+
+    def test_filter_properties_returns_none_for_empty_output(self):
+        from weaviate_engram.client import _filter_properties
+
+        allowed = frozenset({"conversation_id"})
+        # when all keys are unknown the result is None (SDK stays slim)
+        assert _filter_properties({"foo": "bar", "baz": "qux"}, allowed) is None
+        assert _filter_properties({}, allowed) is None
+        assert _filter_properties(None, allowed) is None
+
+    def test_merge_conversation_id_folds_into_properties(self):
+        from weaviate_engram.client import _merge_conversation_id
+
+        # explicit conversation_id wins and is added to a copy of properties
+        merged = _merge_conversation_id({"k": "v"}, "session-1")
+        assert merged == {"k": "v", "conversation_id": "session-1"}
+
+        # whitespace-only conversation_id is dropped
+        assert _merge_conversation_id({"k": "v"}, "   ") == {"k": "v"}
+
+        # both inputs empty → None so SDK call stays slim
+        assert _merge_conversation_id(None, None) is None
+        assert _merge_conversation_id({}, "") is None
+
+    def test_filter_properties_logs_dropped_keys_at_debug(self, caplog):
+        """A caller wondering why their tag didn't land on the memory should
+        find a DEBUG-level breadcrumb naming the dropped keys."""
+        import logging
+        from weaviate_engram.client import _filter_properties
+
+        with caplog.at_level(logging.DEBUG, logger="weaviate_engram.client"):
+            _filter_properties(
+                {"conversation_id": "ok", "weight": "7", "source": "x"},
+                frozenset({"conversation_id"}),
+            )
+        # Both dropped keys appear in a single log line, sorted for stable output.
+        assert any(
+            "Dropped unknown engram property keys" in r.message
+            and "weight" in r.message
+            and "source" in r.message
+            for r in caplog.records
+        )
+
+    def test_filter_properties_silent_when_nothing_dropped(self, caplog):
+        import logging
+        from weaviate_engram.client import _filter_properties
+
+        with caplog.at_level(logging.DEBUG, logger="weaviate_engram.client"):
+            _filter_properties({"conversation_id": "ok"}, frozenset({"conversation_id"}))
+        assert not any("Dropped" in r.message for r in caplog.records)
+
+    def test_merge_conversation_id_does_not_mutate_caller_dict(self):
+        from weaviate_engram.client import _merge_conversation_id
+
+        src = {"k": "v"}
+        _merge_conversation_id(src, "abc")
+        assert src == {"k": "v"}
+
+    def test_merge_conversation_id_explicit_wins_over_properties(self):
+        """A caller passing both ``properties={'conversation_id': ...}`` and an
+        explicit ``conversation_id`` kwarg should get the explicit value.
+
+        This pins the documented precedence (see EngramClient.add_memory
+        docstring) so a future refactor of _merge_conversation_id can't
+        silently invert it.
+        """
+        from weaviate_engram.client import _merge_conversation_id
+
+        merged = _merge_conversation_id(
+            {"conversation_id": "old", "other": "x"}, "new"
+        )
+        assert merged == {"conversation_id": "new", "other": "x"}
 
 
 # ---------------------------------------------------------------------------
@@ -325,12 +406,112 @@ class TestPrefetch:
         assert "</engram-context>" in out
         assert "User prefers terse replies" in out
         assert "Working on the engram plugin" in out
-        # search was called with the resolved user_id
-        assert provider._client.search_calls[-1]["user_id"] == "default"
+        # search was called with the resolved user_id + conversation_id
+        call = provider._client.search_calls[-1]
+        assert call["user_id"] == "default"
+        assert call["conversation_id"] == "session-1"
+
+    def test_prefetch_per_call_session_id_overrides_initialize_value(self, provider):
+        provider._client.search_results = []
+        provider.prefetch("hello?", session_id="override-9")
+        assert provider._client.search_calls[-1]["conversation_id"] == "override-9"
 
     def test_swallows_search_exceptions(self, provider):
         provider._client.raise_on_search = RuntimeError("network down")
         assert provider.prefetch("hello?") == ""
+
+
+# ---------------------------------------------------------------------------
+# Wire-format pin: conversation_id is currently smuggled into
+# properties["conversation_id"] because the Engram SDK has no top-level
+# conversation_id kwarg as of weaviate-engram==0.6.0. If a future refactor
+# drops the value from properties (or moves it to a different key), these
+# tests fail loudly so the change can't slip through unnoticed.
+# ---------------------------------------------------------------------------
+
+
+class TestConversationIdWireFormat:
+    """Wire-format pin: conversation_id is currently smuggled into
+    ``properties["conversation_id"]`` because the Engram SDK has no
+    top-level ``conversation_id`` kwarg as of ``weaviate-engram==0.6.0``.
+
+    These tests drive the *real* ``EngramClient`` wrapper (not the
+    ``FakeEngramClient`` test double) and replace only the SDK method,
+    so they exercise the actual ``_merge_conversation_id`` folding path
+    used in production. If a future refactor drops the value from
+    properties (or moves it to a different key), these tests fail
+    loudly so the change can't slip through unnoticed.
+    """
+
+    def test_search_folds_conversation_id_into_properties(self):
+        from weaviate_engram import EngramClient as RealEngramClient
+
+        captured: dict = {}
+
+        def spy_sdk_search(**kwargs):
+            captured.update(kwargs)
+            return []
+
+        real_wrapper = RealEngramClient(api_key="test-key")
+        real_wrapper._sdk.memories.search = spy_sdk_search
+
+        real_wrapper.search_memories(
+            "anything", user_id="default", conversation_id="sess-77"
+        )
+
+        assert "conversation_id" not in captured, (
+            "Engram SDK (<=0.6.0) does not accept conversation_id as a "
+            "top-level kwarg on memories.search. If this is failing, the "
+            "SDK has grown the field — move the plugin to Phase 2 "
+            "(top-level pass-through) and update the docstrings in "
+            "client.py."
+        )
+        assert captured.get("properties", {}).get("conversation_id") == "sess-77"
+
+    def test_add_folds_conversation_id_into_properties(self):
+        from weaviate_engram import EngramClient as RealEngramClient
+
+        captured: dict = {}
+
+        def spy_sdk_add(input_data, **kwargs):
+            captured.update(kwargs)
+            return {"run_id": "r1", "status": "queued"}
+
+        real_wrapper = RealEngramClient(api_key="test-key")
+        real_wrapper._sdk.memories.add = spy_sdk_add
+
+        real_wrapper.add_memory(
+            "hello world", user_id="default", conversation_id="sess-78"
+        )
+
+        assert "conversation_id" not in captured, (
+            "Engram SDK (<=0.6.0) does not accept conversation_id as a "
+            "top-level kwarg on memories.add. If this is failing, the "
+            "SDK has grown the field — move the plugin to Phase 2 "
+            "(top-level pass-through) and update the docstrings in "
+            "client.py."
+        )
+        assert captured.get("properties", {}).get("conversation_id") == "sess-78"
+
+    def test_add_drops_conversation_id_when_sdk_receives_no_value(self):
+        """Sanity counterpart: when no conversation_id is passed, the
+        SDK call should not invent one. This guards against a future
+        bug where the wrapper accidentally leaks a default conversation
+        tag into every memory."""
+        from weaviate_engram import EngramClient as RealEngramClient
+
+        captured: dict = {}
+
+        def spy_sdk_add(input_data, **kwargs):
+            captured.update(kwargs)
+            return {"run_id": "r1", "status": "queued"}
+
+        real_wrapper = RealEngramClient(api_key="test-key")
+        real_wrapper._sdk.memories.add = spy_sdk_add
+
+        real_wrapper.add_memory("hello world", user_id="default")
+
+        assert "conversation_id" not in (captured.get("properties") or {})
 
 
 # ---------------------------------------------------------------------------
@@ -348,10 +529,22 @@ class TestSyncTurn:
         assert len(provider._client.add_calls) == 1
         call = provider._client.add_calls[0]
         assert call["user_id"] == "default"
+        # conversation_id comes from initialize("session-1", ...) and is
+        # sanitized the same way user_id is — the hyphen survives the sanitizer.
+        assert call["conversation_id"] == "session-1"
         assert call["text"] == (
             "User: Tell me about Hermes.\n"
             "Assistant: Hermes is a self-improving agent built by Nous Research."
         )
+
+    def test_per_call_session_id_overrides_initialize_value(self, provider):
+        provider.sync_turn(
+            "a question that's long enough",
+            "an answer that's long enough",
+            session_id="override-42",
+        )
+        _drain(provider)
+        assert provider._client.add_calls[-1]["conversation_id"] == "override-42"
 
     def test_strips_engram_fence_from_assistant_content(self, provider):
         provider.sync_turn(
@@ -404,9 +597,14 @@ class TestSyncTurn:
         release = threading.Event()
         original_add = provider._client.add_memory
 
-        def slow_add(text, *, user_id, properties=None):
+        def slow_add(text, *, user_id, conversation_id=None, properties=None):
             release.wait(timeout=5.0)
-            return original_add(text, user_id=user_id, properties=properties)
+            return original_add(
+                text,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                properties=properties,
+            )
 
         monkeypatch.setattr(provider._client, "add_memory", slow_add)
 
@@ -517,21 +715,111 @@ class TestTools:
         # The call lands in Engram as plain text scoped to the resolved user_id.
         call = provider._client.add_calls[-1]
         assert call["user_id"] == "default"
+        assert call["conversation_id"] == "session-1"
         assert call["text"] == "User moved to Lisbon in 2026"
         assert call["properties"] is None  # no metadata → no properties forwarded
 
-    def test_store_forwards_metadata_as_engram_properties(self, provider):
-        provider.handle_tool_call(
-            "engram_store",
-            {
-                "content": "User prefers concise responses",
-                "metadata": {"category": "preference", "weight": 7, "drop_me": None},
-            },
+    def test_search_tool_forwards_conversation_id(self, provider):
+        provider._client.search_results = []
+        provider.handle_tool_call("engram_search", {"query": "x"})
+        assert provider._client.search_calls[-1]["conversation_id"] == "session-1"
+
+    def test_fetch_tool_forwards_conversation_id(self, provider):
+        provider._client.search_results = []
+        provider.handle_tool_call("engram_fetch", {})
+        assert provider._client.search_calls[-1]["conversation_id"] == "session-1"
+
+    def test_engram_client_add_memory_strips_unknown_properties(self):
+        """EngramClient.add_memory strips unknown keys before calling the SDK.
+
+        This is the firewall that prevents 'invalid scope property' errors
+        at the backend: any property key not in _ALLOWED_PROPERTIES is
+        dropped before the SDK call is issued.
+        """
+        from weaviate_engram.client import EngramClient
+
+        calls = []
+
+        class FakeSDK:
+            class Memories:
+                @staticmethod
+                def add(text, *, user_id, properties=None):
+                    calls.append({"text": text, "user_id": user_id, "properties": properties})
+                    class Run:
+                        run_id = "r1"
+                        status = "queued"
+                    return Run()
+
+            memories = Memories()
+
+        class FakeClient(EngramClient):
+            def __init__(self):
+                # skip real SDK init, just set the attribute
+                self._sdk = FakeSDK()
+                self._api_key = "test"
+                self._base_url = "test"
+                self._timeout = 10.0
+
+        client = FakeClient()
+        # session_id and source are not in _ALLOWED_PROPERTIES
+        result = client.add_memory(
+            "test",
+            user_id="u1",
+            conversation_id=None,
+            properties={"session_id": "s1", "source": "debug"},
         )
-        call = provider._client.add_calls[-1]
-        # Engram's `properties` field is dict[str, str]; values get stringified
-        # and explicit Nones are dropped.
-        assert call["properties"] == {"category": "preference", "weight": "7"}
+        assert calls[0]["properties"] is None  # unknown keys stripped
+
+        # conversation_id is allowed
+        result = client.add_memory(
+            "test",
+            user_id="u1",
+            conversation_id="cid1",
+            properties={"session_id": "s1"},
+        )
+        assert calls[1]["properties"] == {"conversation_id": "cid1"}
+
+    def test_engram_client_search_memories_strips_unknown_properties(self):
+        """search_memories now mirrors add_memory: ``properties`` is filtered
+        against ``_ALLOWED_PROPERTIES`` before reaching the SDK, so a caller
+        passing a tag the backend doesn't know about can't trigger an
+        'invalid scope property' error on recall."""
+        from weaviate_engram.client import EngramClient
+
+        calls = []
+
+        class FakeSDK:
+            class Memories:
+                @staticmethod
+                def search(*, query, user_id, properties=None):
+                    calls.append({"query": query, "user_id": user_id, "properties": properties})
+                    return []
+
+            memories = Memories()
+
+        class FakeClient(EngramClient):
+            def __init__(self):
+                self._sdk = FakeSDK()
+                self._api_key = "test"
+                self._base_url = "test"
+                self._timeout = 10.0
+
+        client = FakeClient()
+
+        # unknown property is dropped
+        client.search_memories(
+            "anything", user_id="u1", properties={"source": "debug"}
+        )
+        assert calls[0]["properties"] is None
+
+        # explicit conversation_id wins over conflicting key in properties
+        client.search_memories(
+            "anything",
+            user_id="u1",
+            conversation_id="cid-a",
+            properties={"conversation_id": "cid-b", "source": "debug"},
+        )
+        assert calls[1]["properties"] == {"conversation_id": "cid-a"}
 
     def test_store_requires_content(self, provider):
         result = json.loads(provider.handle_tool_call("engram_store", {"content": "  "}))

@@ -136,24 +136,6 @@ def _is_trivial(text: str) -> bool:
     return bool(_TRIVIAL_RE.match((text or "").strip()))
 
 
-def _coerce_properties(raw: Any) -> Optional[Dict[str, str]]:
-    """Coerce a tool-call ``metadata`` arg into Engram's ``properties`` shape.
-
-    Engram's ``properties`` field is typed ``dict[str, str]``. Models sometimes
-    pass nested or non-string values, so we stringify everything here and
-    return ``None`` (rather than an empty dict) when nothing usable is left —
-    that keeps the SDK call slim when there's no real metadata.
-    """
-    if not isinstance(raw, dict) or not raw:
-        return None
-    out: Dict[str, str] = {}
-    for key, value in raw.items():
-        if value is None:
-            continue
-        out[str(key)] = str(value)
-    return out or None
-
-
 def _format_recall_context(results: List[Dict[str, Any]], limit: int) -> str:
     results = results[:limit]
     if not results:
@@ -194,14 +176,6 @@ STORE_SCHEMA = {
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "The memory content to store."},
-            "metadata": {
-                "type": "object",
-                "description": (
-                    "Optional flat key/value tags forwarded to Engram's "
-                    "`properties` field. Keys and values are stringified."
-                ),
-                "additionalProperties": {"type": "string"},
-            },
         },
         "required": ["content"],
         "additionalProperties": False,
@@ -354,6 +328,22 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
                 self._active = False
                 self._active = False
 
+    def _resolve_conversation_id(self, session_id: str = "") -> Optional[str]:
+        """Pick the session id to forward as Engram's ``conversation_id``.
+
+        Per-call ``session_id`` (passed via prefetch / sync_turn) wins over
+        the value stashed at ``initialize`` so a host that reuses one
+        provider across sessions still scopes memories correctly. The
+        result is sanitized with the same charset rule we apply to
+        ``user_id`` because we don't want to surprise the engram backend
+        with characters its tenant naming layer rejects.
+        """
+        raw = (session_id or "").strip() or (self._session_id or "").strip()
+        if not raw:
+            return None
+        cleaned = _sanitize_user_id(raw)
+        return cleaned or None
+
     def system_prompt_block(self) -> str:
         if not self._active:
             return ""
@@ -379,6 +369,7 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
                 query[:500],
                 user_id=self._user_id,
                 limit=self._max_recall_results,
+                conversation_id=self._resolve_conversation_id(session_id),
             )
             return _format_recall_context(results, self._max_recall_results)
         except Exception:
@@ -404,10 +395,11 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
         text = f"User: {clean_user}\nAssistant: {clean_assistant}"
         client = self._client
         user_id = self._user_id
+        conversation_id = self._resolve_conversation_id(session_id)
 
         def _run() -> None:
             try:
-                client.add_memory(text, user_id=user_id)
+                client.add_memory(text, user_id=user_id, conversation_id=conversation_id)
             except Exception:
                 logger.debug("Weaviate Engram sync_turn failed", exc_info=True)
 
@@ -453,7 +445,12 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
         except Exception:
             limit = 5
         try:
-            results = self._client.search_memories(query, user_id=self._user_id, limit=limit)
+            results = self._client.search_memories(
+                query,
+                user_id=self._user_id,
+                limit=limit,
+                conversation_id=self._resolve_conversation_id(),
+            )
         except Exception as exc:
             return tool_error(f"Search failed: {exc}")
         formatted: List[Dict[str, Any]] = []
@@ -472,12 +469,11 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
         content = str(args.get("content") or "").strip()
         if not content:
             return tool_error("content is required")
-        properties = _coerce_properties(args.get("metadata"))
         try:
             run = self._client.add_memory(
                 content,
                 user_id=self._user_id,
-                properties=properties,
+                conversation_id=self._resolve_conversation_id(),
             )
         except Exception as exc:
             return tool_error(f"Store failed: {exc}")
@@ -488,7 +484,10 @@ class WeaviateEngramMemoryProvider(MemoryProvider):
         query = str(args.get("query") or "user profile facts").strip() or "user profile facts"
         try:
             results = self._client.search_memories(
-                query, user_id=self._user_id, limit=self._max_recall_results
+                query,
+                user_id=self._user_id,
+                limit=self._max_recall_results,
+                conversation_id=self._resolve_conversation_id(),
             )
         except Exception as exc:
             return tool_error(f"Fetch failed: {exc}")

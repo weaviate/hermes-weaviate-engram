@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "https://api.engram.weaviate.io"
 
+# Canonical list of properties the Engram backend actually accepts.
+# Any property not in this list causes an "invalid scope property" error
+# at the backend. Only conversation_id is supported as of 2026-06-06.
+# Extend this set when the backend schema grows new keys.
+_ALLOWED_PROPERTIES: frozenset[str] = frozenset({"conversation_id"})
+
 
 class EngramNotAvailableError(RuntimeError):
     """Raised when the `engram` SDK can't be imported.
@@ -79,6 +85,7 @@ class EngramClient:
         text: str,
         *,
         user_id: str,
+        conversation_id: Optional[str] = None,
         properties: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Ingest a single text payload into Engram for the given user.
@@ -90,28 +97,121 @@ class EngramClient:
         soft-isolation tags the pipeline can filter on at search time.
         Callers must pre-stringify both keys and values (the SDK enforces
         ``str -> str``).
+
+        Only ``conversation_id`` is a valid property key as far as the
+        Engram backend is concerned. Unknown keys cause "invalid scope
+        property" errors at the backend, so unknown keys are stripped
+        before sending. The ``conversation_id`` wins over any conflicting
+        key in ``properties``.
+
+        ``conversation_id`` is a Hermes-side concept that scopes a memory
+        to a specific chat session. As of ``weaviate-engram==0.6.0`` the
+        SDK does NOT accept ``conversation_id`` as a top-level kwarg on
+        ``memories.add`` (signature: ``(input_data, *, user_id, group,
+        properties)``). Until the SDK grows a first-class field, this
+        client folds the value into ``properties["conversation_id"]`` so
+        it is at least persisted on the memory object. Whether the
+        Engram backend filters search results on this property is
+        server-side behavior and out of scope for this client — do not
+        assume conversation-scoped recall works without verifying
+        against the deployed Engram version.
         """
-        kwargs: Dict[str, Any] = {"user_id": user_id}
-        if properties:
-            kwargs["properties"] = properties
-        run = self._sdk.memories.add(text, **kwargs)
+        filtered = _filter_properties(properties, _ALLOWED_PROPERTIES)
+        merged_props = _merge_conversation_id(filtered, conversation_id)
+        run = self._sdk.memories.add(
+            text,
+            user_id=user_id,
+            properties=merged_props,
+        )
         return _run_to_dict(run)
 
     def search_memories(
-        self, query: str, *, user_id: str, limit: int = 10
+        self,
+        query: str,
+        *,
+        user_id: str,
+        limit: int = 10,
+        conversation_id: Optional[str] = None,
+        properties: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         """Semantic recall. Returns at most `limit` memory dicts.
 
         The SDK's SearchResults is list-like; we slice here so the
         caller never has to know whether `limit` is honoured server-side.
+
+        ``properties`` and ``conversation_id`` follow the same rules as
+        ``add_memory``: unknown property keys are stripped against
+        ``_ALLOWED_PROPERTIES`` before being sent, and an explicit
+        ``conversation_id`` wins over any conflicting key in ``properties``.
+
+        ``conversation_id`` narrows results to a specific conversation.
+        As of ``weaviate-engram==0.6.0`` the SDK does NOT accept it as
+        a top-level kwarg on ``memories.search`` (signature: ``(*,
+        query, topics, user_id, group, retrieval_config, properties)``).
+        Until the SDK grows a first-class field, this client forwards
+        it as ``properties["conversation_id"]`` so the value is at
+        least sent to the backend. Whether the backend actually
+        filters on it is server-side behavior and not guaranteed —
+        treat conversation-scoped recall as best-effort, not as
+        hard isolation, until the SDK exposes a real field.
         """
-        results = self._sdk.memories.search(query=query, user_id=user_id)
+        filtered = _filter_properties(properties, _ALLOWED_PROPERTIES)
+        merged_props = _merge_conversation_id(filtered, conversation_id)
+        results = self._sdk.memories.search(
+            query=query,
+            user_id=user_id,
+            properties=merged_props,
+        )
         out: List[Dict[str, Any]] = []
         for memory in results:
             out.append(_memory_to_dict(memory))
             if len(out) >= limit:
                 break
         return out
+
+
+def _filter_properties(
+    properties: Optional[Dict[str, str]],
+    allowed: frozenset[str],
+) -> Optional[Dict[str, str]]:
+    """Strip unknown property keys, keeping only those in ``allowed``.
+
+    The Engram backend rejects any property key not in its schema with
+    "invalid scope property". Until the schema is extended this function
+    acts as a firewall so callers can pass arbitrary metadata without
+    triggering errors — unknown keys are dropped, and dropped keys are
+    logged at DEBUG so the loss is debuggable when callers wonder why
+    their tag didn't land on the memory.
+    """
+    if not properties:
+        return None
+    filtered = {k: v for k, v in properties.items() if k in allowed}
+    dropped = set(properties) - filtered.keys()
+    if dropped:
+        logger.debug(
+            "Dropped unknown engram property keys: %s (allowed=%s)",
+            sorted(dropped),
+            sorted(allowed),
+        )
+    return filtered or None
+
+
+def _merge_conversation_id(
+    properties: Optional[Dict[str, str]],
+    conversation_id: Optional[str],
+) -> Optional[Dict[str, str]]:
+    """Fold an explicit ``conversation_id`` into the ``properties`` dict.
+
+    Returns a fresh dict so callers can keep reusing their own. Empty /
+    whitespace-only values are dropped. If the result has no entries we
+    return ``None`` so the SDK call stays slim.
+    """
+    merged: Dict[str, str] = dict(properties or {})
+    if conversation_id is not None:
+        cid = str(conversation_id).strip()
+        if cid:
+            merged["conversation_id"] = cid
+    return merged or None
 
 
 def _run_to_dict(run: Any) -> Dict[str, Any]:
